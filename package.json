@@ -34,7 +34,11 @@
     "check": "tsc --noEmit",
     "example:server": "bun run examples/localnet/server.ts",
     "example:client": "bun run examples/localnet/client.ts",
-    "example:e2e": "bun run examples/localnet/e2e.ts"
+    "example:e2e": "bun run examples/localnet/e2e.ts",
+    "example:sponsored-server": "bun run examples/localnet/sponsored-server.ts",
+    "example:sponsored-e2e": "bun run examples/localnet/sponsored-e2e.ts",
+    "example:sponsored-usdc-e2e": "bun run examples/localnet/sponsored-usdc-e2e.ts",
+    "example:usdc-e2e": "bun run examples/localnet/usdc-e2e.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"

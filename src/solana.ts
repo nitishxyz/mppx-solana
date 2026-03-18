@@ -34,6 +34,22 @@ export type SolanaSigner = {
   signTransaction(transaction: Transaction): Promise<Transaction>;
 };
 
+export type SolanaSponsorConfig = {
+  feePayer: Keypair;
+  feeTokenAmount: string;
+  sponsorPath: string;
+};
+
+export type SponsorHandlerParameters = {
+  feePayer: Keypair;
+  feeTokenAmount: string;
+  connection?: Connection;
+  getConnection?: (
+    cluster?: string,
+    request?: SolanaRequest,
+  ) => Promise<Connection> | Connection;
+};
+
 export type SolanaClientParameters = {
   connection?: Connection;
   getConnection?: (
@@ -59,6 +75,7 @@ export type SolanaServerParameters = {
     cluster?: string,
     request?: SolanaRequest,
   ) => Promise<Connection> | Connection;
+  sponsor?: SolanaSponsorConfig;
 };
 
 export const charge = Method.from({
@@ -79,8 +96,12 @@ export const charge = Method.from({
       decimals: z.number(),
       description: z.optional(z.string()),
       externalId: z.optional(z.string()),
+      feePayer: z.optional(z.string()),
+      feeTokenAmount: z.optional(z.string()),
       memo: z.optional(z.string()),
       recipient: z.string(),
+      sponsored: z.optional(z.boolean()),
+      sponsorPath: z.optional(z.string()),
     }),
   },
 });
@@ -100,6 +121,15 @@ export function client(parameters: SolanaClientParameters = {}) {
         request.cluster,
         request,
       );
+
+      if (request.sponsored && request.sponsorPath) {
+        return createSponsoredCredential({
+          challenge,
+          connection,
+          request,
+          signer,
+        });
+      }
 
       const transaction = await buildTransaction({
         connection,
@@ -133,6 +163,62 @@ export function client(parameters: SolanaClientParameters = {}) {
   });
 }
 
+async function createSponsoredCredential(parameters: {
+  challenge: Parameters<typeof Credential.serialize>[0]["challenge"];
+  connection: Connection;
+  request: SolanaRequest;
+  signer: SolanaSigner;
+}) {
+  const { challenge, connection, request, signer } = parameters;
+
+  const realm = (challenge as { realm?: string }).realm ?? "";
+  const protocol = realm.startsWith("localhost") || realm.startsWith("127.") ? "http" : "https";
+  const sponsorUrl = `${protocol}://${realm}${request.sponsorPath}`;
+
+  const response = await fetch(sponsorUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      publicKey: signer.publicKey.toBase58(),
+      request,
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Sponsor endpoint returned ${response.status}: ${text}`);
+  }
+
+  const body = (await response.json()) as {
+    transaction: string;
+    lastValidBlockHeight: number;
+  };
+  const transaction = Transaction.from(Buffer.from(body.transaction, "base64"));
+
+  const signedTransaction = await signer.signTransaction(transaction);
+  const signature = await connection.sendRawTransaction(
+    signedTransaction.serialize(),
+  );
+
+  await connection.confirmTransaction(
+    {
+      blockhash: transaction.recentBlockhash!,
+      lastValidBlockHeight: body.lastValidBlockHeight,
+      signature,
+    },
+    normalizeCommitment(request.commitment),
+  );
+
+  return Credential.serialize({
+    challenge,
+    payload: {
+      signature,
+      type: "hash",
+    },
+    source: `did:pkh:solana:${request.cluster ?? "mainnet-beta"}:${signer.publicKey.toBase58()}`,
+  });
+}
+
 export function server(parameters: SolanaServerParameters = {}) {
   return Method.toServer(charge, {
     defaults: {
@@ -143,8 +229,12 @@ export function server(parameters: SolanaServerParameters = {}) {
       decimals: parameters.decimals,
       description: parameters.description,
       externalId: parameters.externalId,
+      feePayer: parameters.sponsor?.feePayer.publicKey.toBase58(),
+      feeTokenAmount: parameters.sponsor?.feeTokenAmount,
       memo: parameters.memo,
       recipient: parameters.recipient,
+      sponsored: parameters.sponsor ? true : undefined,
+      sponsorPath: parameters.sponsor?.sponsorPath,
     },
     async verify({ credential, request }) {
       const resolvedRequest = charge.schema.request.parse(request);
@@ -198,6 +288,49 @@ export function server(parameters: SolanaServerParameters = {}) {
   });
 }
 
+export function createSponsorHandler(parameters: SponsorHandlerParameters) {
+  return async (httpRequest: Request): Promise<Response> => {
+    try {
+      const body = (await httpRequest.json()) as {
+        publicKey: string;
+        request: unknown;
+      };
+
+      const request = charge.schema.request.parse(body.request);
+      const payer = new PublicKey(body.publicKey);
+
+      const connection = await resolveConnection(
+        parameters.connection,
+        parameters.getConnection,
+        request.cluster,
+        request,
+      );
+
+      const transaction = await buildSponsoredTransaction({
+        connection,
+        feePayer: parameters.feePayer,
+        feeTokenAmount: parameters.feeTokenAmount,
+        payer,
+        request,
+      });
+
+      transaction.partialSign(parameters.feePayer);
+
+      const serialized = transaction
+        .serialize({ requireAllSignatures: false })
+        .toString("base64");
+
+      return Response.json({
+        transaction: serialized,
+        lastValidBlockHeight: transaction.lastValidBlockHeight,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return Response.json({ error: message }, { status: 400 });
+    }
+  };
+}
+
 async function buildTransaction(parameters: {
   connection: Connection;
   payer: PublicKey;
@@ -241,6 +374,96 @@ async function buildTransaction(parameters: {
         destinationAta,
         payer,
         BigInt(request.amount),
+        request.decimals,
+        [],
+        TOKEN_PROGRAM_ID,
+      ),
+    );
+  }
+
+  if (request.memo) {
+    transaction.add(
+      new TransactionInstruction({
+        data: Buffer.from(request.memo, "utf8"),
+        keys: [],
+        programId: MEMO_PROGRAM_ID,
+      }),
+    );
+  }
+
+  return transaction;
+}
+
+async function buildSponsoredTransaction(parameters: {
+  connection: Connection;
+  feePayer: Keypair;
+  feeTokenAmount: string;
+  payer: PublicKey;
+  request: SolanaRequest;
+}) {
+  const { connection, feePayer, feeTokenAmount, payer, request } = parameters;
+  const recipient = new PublicKey(request.recipient);
+  const transaction = new Transaction();
+  const { blockhash, lastValidBlockHeight } =
+    await connection.getLatestBlockhash(normalizeCommitment(request.commitment));
+
+  transaction.feePayer = feePayer.publicKey;
+  transaction.recentBlockhash = blockhash;
+  transaction.lastValidBlockHeight = lastValidBlockHeight;
+
+  if (isNativeCurrency(request.currency)) {
+    const lamports = toSafeInteger(request.amount, "amount");
+    const feeLamports = toSafeInteger(feeTokenAmount, "feeTokenAmount");
+
+    transaction.add(
+      SystemProgram.transfer({
+        fromPubkey: payer,
+        lamports,
+        toPubkey: recipient,
+      }),
+      SystemProgram.transfer({
+        fromPubkey: payer,
+        lamports: feeLamports,
+        toPubkey: feePayer.publicKey,
+      }),
+    );
+  } else {
+    const mint = new PublicKey(request.currency);
+    const sourceAta = getAssociatedTokenAddressSync(mint, payer, false);
+    const destinationAta = getAssociatedTokenAddressSync(mint, recipient, false);
+    const feePayerAta = getAssociatedTokenAddressSync(mint, feePayer.publicKey, false);
+
+    transaction.add(
+      createAssociatedTokenAccountIdempotentInstruction(
+        feePayer.publicKey,
+        destinationAta,
+        recipient,
+        mint,
+        TOKEN_PROGRAM_ID,
+      ),
+      createAssociatedTokenAccountIdempotentInstruction(
+        feePayer.publicKey,
+        feePayerAta,
+        feePayer.publicKey,
+        mint,
+        TOKEN_PROGRAM_ID,
+      ),
+      createTransferCheckedInstruction(
+        sourceAta,
+        mint,
+        destinationAta,
+        payer,
+        BigInt(request.amount),
+        request.decimals,
+        [],
+        TOKEN_PROGRAM_ID,
+      ),
+      createTransferCheckedInstruction(
+        sourceAta,
+        mint,
+        feePayerAta,
+        payer,
+        BigInt(feeTokenAmount),
         request.decimals,
         [],
         TOKEN_PROGRAM_ID,

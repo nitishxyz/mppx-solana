@@ -1,6 +1,7 @@
 export {
   charge,
   client,
+  createSponsorHandler,
   LOCALNET_RPC_URL,
   server,
   MEMO_PROGRAM_ID,
@@ -13,4 +14,6 @@ export type {
   SolanaRequest,
   SolanaServerParameters,
   SolanaSigner,
+  SolanaSponsorConfig,
+  SponsorHandlerParameters,
 } from "./src/solana";
