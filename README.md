@@ -258,6 +258,147 @@ mppx.charge({
 
 The server will reject transactions that don't contain the expected memo.
 
+## Sponsored fees (gasless for users)
+
+Enable gasless transactions so users only need USDC (or any SPL token) — no SOL required. The server sponsors the Solana transaction fee and the user reimburses the server in the payment token.
+
+```
+Client                          Server
+  │                               │
+  │  GET /api/resource            │
+  │ ────────────────────────────► │
+  │                               │
+  │  402 + Challenge              │
+  │  (sponsored=true, sponsorPath)│
+  │ ◄──────────────────────────── │
+  │                               │
+  │  POST /sponsor                │
+  │  { publicKey, request }       │
+  │ ────────────────────────────► │
+  │                               │
+  │  Partially signed tx          │
+  │  (feePayer=server)            │
+  │ ◄──────────────────────────── │
+  │                               │
+  │  Co-signs & sends tx          │
+  │  Retries with tx signature    │
+  │ ────────────────────────────► │
+  │                               │
+  │  Verifies tx on-chain         │
+  │  200 + Resource + Receipt     │
+  │ ◄──────────────────────────── │
+```
+
+### How it works
+
+1. Server returns a `402` challenge with `sponsored: true` and a `sponsorPath`
+2. Client POSTs its public key to the sponsor endpoint
+3. Server builds the transaction with itself as `feePayer`, includes the payment transfer + a small fee reimbursement transfer from user → server
+4. Server partially signs as fee payer and returns the serialized transaction
+5. Client co-signs as the payment authority and submits
+6. Server verifies the payment on-chain as usual
+
+The user pays the API cost + a small fee surcharge (e.g., 0.01 USDC) in the same token. The server pays the Solana network fee in SOL and receives the token reimbursement.
+
+### Server setup
+
+```ts
+import { Keypair } from "@solana/web3.js";
+import { Mppx } from "mppx/server";
+import {
+  createSponsorHandler,
+  server as solanaServer,
+} from "mppx-solana";
+
+const sponsorKeypair = Keypair.fromSecretKey(/* server fee payer key */);
+
+const mppx = Mppx.create({
+  methods: [
+    solanaServer({
+      recipient: "MerchantWalletPublicKeyBase58",
+      currency: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+      decimals: 6,
+      cluster: "mainnet-beta",
+      sponsor: {
+        feePayer: sponsorKeypair,
+        feeTokenAmount: "10000", // 0.01 USDC reimbursement
+        sponsorPath: "/sponsor",
+      },
+    }),
+  ],
+  realm: "api.example.com",
+  secretKey: process.env.MPP_SECRET_KEY!,
+});
+
+const handleSponsor = createSponsorHandler({
+  feePayer: sponsorKeypair,
+  feeTokenAmount: "10000",
+  connection: new Connection("https://api.mainnet-beta.solana.com"),
+});
+
+Bun.serve({
+  routes: {
+    "/api/resource": {
+      GET: async (request) => {
+        const result = await mppx.charge({
+          amount: "100000", // 0.10 USDC
+        })(request);
+
+        if (result.status === 402) return result.challenge;
+        return result.withReceipt(Response.json({ data: "paid content" }));
+      },
+    },
+    "/sponsor": {
+      POST: handleSponsor,
+    },
+  },
+});
+```
+
+### Client
+
+No changes needed — the client automatically detects `sponsored: true` in the challenge and uses the sponsor endpoint.
+
+```ts
+import { Connection, Keypair } from "@solana/web3.js";
+import { Mppx } from "mppx/client";
+import { client as solanaClient } from "mppx-solana";
+
+const mppx = Mppx.create({
+  methods: [
+    solanaClient({
+      connection: new Connection("https://api.mainnet-beta.solana.com"),
+      signer: Keypair.fromSecretKey(/* user key */),
+    }),
+  ],
+  polyfill: false,
+});
+
+// User pays 0.11 USDC (0.10 payment + 0.01 fee) — zero SOL needed
+const response = await mppx.fetch("https://api.example.com/api/resource");
+```
+
+### Cost breakdown
+
+For a 0.10 USDC API call with sponsored fees:
+
+| | Without sponsorship | With sponsorship |
+|---|---|---|
+| User pays (USDC) | 0.10 | 0.11 (0.10 + 0.01 fee) |
+| User pays (SOL) | ~0.002 SOL (tx fee + ATA rent) | 0 |
+| Server pays (SOL) | 0 | ~0.004 SOL (tx fee + ATA rent) |
+| Server receives (USDC) | 0 | 0.01 (fee reimbursement) |
+
+The server accumulates USDC reimbursements and needs to periodically swap USDC → SOL to stay funded. Initial SOL seed required (~0.1 SOL ≈ 20,000+ transactions).
+
+### Sponsor configuration
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sponsor.feePayer` | `Keypair` | Yes | Server keypair that pays Solana tx fees |
+| `sponsor.feeTokenAmount` | `string` | Yes | Amount in token smallest unit to reimburse (e.g., `"10000"` = 0.01 USDC) |
+| `sponsor.sponsorPath` | `string` | Yes | HTTP path for the sponsor endpoint (e.g., `"/sponsor"`) |
+
 ## Server configuration
 
 | Parameter | Type | Required | Description |
@@ -272,6 +413,7 @@ The server will reject transactions that don't contain the expected memo.
 | `memo` | `string` | No | Required memo string on transactions |
 | `description` | `string` | No | Human-readable description |
 | `externalId` | `string` | No | External reference ID for receipts |
+| `sponsor` | `SolanaSponsorConfig` | No | Enable sponsored/gasless transactions |
 
 ## Client configuration
 
@@ -281,9 +423,9 @@ The server will reject transactions that don't contain the expected memo.
 | `connection` | `Connection` | No | RPC connection |
 | `getConnection` | `function` | No | Dynamic connection factory |
 
-## Running the example
+## Running the examples
 
-A full end-to-end example using a local Solana validator is included. This project uses [Solforge](https://github.com/nitishxyz/solforge) as the local validator.
+Full end-to-end examples using a local Solana validator are included. This project uses [Solforge](https://github.com/nitishxyz/solforge) as the local validator.
 
 ```bash
 # Install solforge
@@ -292,8 +434,11 @@ bun add -g solforge
 # Start the local validator (picks up sf.config.json automatically)
 solforge
 
-# In another terminal, run the e2e test
-bun run example:e2e
+# In another terminal, run the e2e tests
+bun run example:e2e                  # SOL payment
+bun run example:usdc-e2e             # USDC payment
+bun run example:sponsored-e2e        # Sponsored SOL payment
+bun run example:sponsored-usdc-e2e   # Sponsored USDC payment (gasless)
 ```
 
 Or run server and client separately:
