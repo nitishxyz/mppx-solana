@@ -1,0 +1,54 @@
+{
+  "name": "mppx-solana",
+  "version": "0.1.0",
+  "description": "Solana payment method for the Machine Payments Protocol (mppx)",
+  "type": "module",
+  "module": "index.ts",
+  "main": "index.ts",
+  "types": "index.ts",
+  "exports": {
+    ".": {
+      "import": "./index.ts",
+      "types": "./index.ts"
+    }
+  },
+  "files": [
+    "src",
+    "index.ts"
+  ],
+  "keywords": [
+    "mpp",
+    "mppx",
+    "solana",
+    "payments",
+    "machine-payments",
+    "402",
+    "spl-token"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nitishxyz/mppx-solana"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "example:server": "bun run examples/localnet/server.ts",
+    "example:client": "bun run examples/localnet/client.ts",
+    "example:e2e": "bun run examples/localnet/e2e.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5",
+    "@solana/web3.js": "^1.98.0",
+    "@solana/spl-token": "^0.4.0",
+    "mppx": "^0.4.0"
+  },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
+    "bs58": "^6.0.0",
+    "mppx": "^0.4.6"
+  }
+}
