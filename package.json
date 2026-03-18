@@ -1,6 +1,6 @@
 {
   "name": "mppx-solana",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Solana payment method for the Machine Payments Protocol (mppx)",
   "type": "module",
   "module": "index.ts",
